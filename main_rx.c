@@ -26,8 +26,8 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <string.h>
-#include "mbedtls/ecdsa.h"
-#include "mbedtls/ecp.h"
+//#include "mbedtls/md.h"
+#include "mbedtls/platform.h"
 #include "mbedtls/sha256.h"
 #include "mbedtls/memory_buffer_alloc.h"
 
@@ -45,9 +45,21 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+#pragma pack(push,1)
+typedef struct {
+  uint16_t sof;      // 0xAA55
+  uint8_t  ver;      // 1
+  uint32_t seq;
+  uint32_t ts_ms;
+  int16_t  temp_c;   // целое, градусы C
+  uint16_t hum_pc;   // целое, %
+  uint8_t  hmac[8];  // первые 8 байт HMAC-SHA256
+  uint16_t eof;      // 0x55AA
+} hmac_frame_t;
+#pragma pack(pop)
+
 static int start_count = 0;
 static int tim2_counter = 0;
-
 
 static int sysytick_counter_top  = 4;
 static int delay_counter_top = 1;
@@ -66,13 +78,11 @@ static int  indicator_number = 0000;
 #define EOF_WORD   0x55AAu
 
 // Публичный ключ для проверки подписи (65 байт: 0x04 || X || Y)
-static const uint8_t pubkey65[65] = {
-    0x04, 0xf4, 0x26, 0x16, 0x27, 0x3a, 0x1e, 0xbc, 0xba, 0x52, 0xe6, 0x7c,
-    0xc8, 0xa6, 0xf3, 0x46, 0x8c, 0x97, 0xac, 0xbc, 0x3a, 0x07, 0x41, 0x79,
-    0x12, 0xf3, 0x27, 0xfb, 0x7b, 0x18, 0xaa, 0x0f, 0xca, 0x51, 0x39, 0x29,
-    0x0e, 0x67, 0x00, 0x8f, 0xf1, 0x46, 0xe6, 0x7a, 0x5b, 0xac, 0x5e, 0x85,
-    0xbc, 0xe2, 0x30, 0x10, 0x6c, 0xa8, 0xb2, 0xb8, 0xd8, 0x29, 0x49, 0x70,
-    0xb7, 0x97, 0x36, 0x28, 0xcc
+static const uint8_t hmac_key[32] = {
+  0xfd, 0xc5, 0xbe, 0xb0, 0x72, 0x1c, 0x64, 0x04,
+  0x4f, 0x3a, 0x05, 0xc3, 0x6f, 0xdc, 0xab, 0xb8,
+  0xb5, 0x97, 0xbd, 0xd1, 0xc7, 0x54, 0xa1, 0x35,
+  0xf7, 0x05, 0x65, 0xde, 0xce, 0xb2, 0x86, 0x34
 };
 /* USER CODE END PD */
 
@@ -194,7 +204,6 @@ static void gpio_config(void)
     return;
 }
 
-
 __attribute__((naked)) static void delay(void)
 {
     asm ("push {r7, lr}");    // Сохраняем регистр-ссылку LR и R7 в стек (чтобы вернуться обратно)
@@ -241,21 +250,6 @@ static void timers_config(void)  //1s
     return;
 }
 
-//static int start_count = 0;
-//static int tim2_counter = 0;
-//
-//
-//static int sysytick_counter_top  = 4;
-//static int delay_counter_top = 0;
-//static int ms = 0; //0.....1000
-//static int ms_old = 0;
-//
-//static int sysytick_counter = 0;
-//static int delay_counter = 0;
-//
-//static int  indicator_number = 1000;
-
-
 void TIM2_IRQHandler(void)
 {
     if(start_count)
@@ -300,20 +294,10 @@ static void exti_config(void)
 
 void EXTI0_1_IRQHandler(void)
 {
-
-    /*
-     * Если разница больше чем 50 между ms_old и ms, то выполнить действие
-     */
-
-     if((ms - ms_old) > 50)
+	if((ms - ms_old) > 50)
      {
-     	//LL_GPIO_TogglePin(GPIOC, LL_GPIO_PIN_9);
     	 show_temp = (show_temp + 1)%2;
      }
-
-    /*
-     * Обновить значение old_ms и сбросить флаг нулевой линии прерывания
-     */
 
     ms_old = ms;
 
@@ -417,31 +401,80 @@ void set_all_indicators(indicator_number)
 	}
 }
 
-
-static int verify_der_p256(const uint8_t *msg, size_t len,
-                           const uint8_t *sig_der, size_t sig_len)
+/**
+ * Вычисляет HMAC-SHA256 подпись для данных
+ */
+/**
+ * Упрощенная HMAC-SHA256 реализация без mbedtls_md
+ */
+static int compute_hmac_sha256(const uint8_t *data, size_t data_len, uint8_t *hmac)
 {
-  int ret;
-  uint8_t hash[32];
-  mbedtls_ecdsa_context ctx;
-  mbedtls_ecdsa_init(&ctx);
+    mbedtls_sha256_context ctx;
+    uint8_t k_ipad[64];
+    uint8_t k_opad[64];
+    uint8_t tmp_hash[32];
+    size_t i;
 
-  if ((ret = mbedtls_ecp_group_load(&ctx.grp, MBEDTLS_ECP_DP_SECP256R1)) != 0)
-    goto out;
-  if ((ret = mbedtls_ecp_point_read_binary(&ctx.grp, &ctx.Q,
-                                           pubkey65, sizeof(pubkey65))) != 0)
-    goto out;
+    // Инициализация pads
+    memset(k_ipad, 0, 64);
+    memset(k_opad, 0, 64);
 
-  mbedtls_sha256_ret(msg, len, hash, 0);
-  ret = mbedtls_ecdsa_read_signature(&ctx, hash, sizeof(hash),
-                                     sig_der, sig_len);
-out:
-  mbedtls_ecdsa_free(&ctx);
-  return ret;
+    // Копируем ключ (предполагаем, что ключ 32 байта или меньше)
+    if (sizeof(hmac_key) <= 64) {
+        memcpy(k_ipad, hmac_key, sizeof(hmac_key));
+        memcpy(k_opad, hmac_key, sizeof(hmac_key));
+    } else {
+        // Если ключ длиннее - хешируем его
+        mbedtls_sha256_init(&ctx);
+        mbedtls_sha256_starts(&ctx, 0);
+        mbedtls_sha256_update(&ctx, hmac_key, sizeof(hmac_key));
+        mbedtls_sha256_finish(&ctx, k_ipad);
+        mbedtls_sha256_free(&ctx);
+        memcpy(k_opad, k_ipad, 32);
+    }
+
+    // XOR с константами
+    for (i = 0; i < 64; i++) {
+        k_ipad[i] ^= 0x36;
+        k_opad[i] ^= 0x5C;
+    }
+
+    // Внутренний хеш: hash((key ^ ipad) || message)
+    mbedtls_sha256_init(&ctx);
+    mbedtls_sha256_starts(&ctx, 0);
+    mbedtls_sha256_update(&ctx, k_ipad, 64);
+    mbedtls_sha256_update(&ctx, data, data_len);
+    mbedtls_sha256_finish(&ctx, tmp_hash);
+    mbedtls_sha256_free(&ctx);
+
+    // Внешний хеш: hash((key ^ opad) || inner_hash)
+    mbedtls_sha256_init(&ctx);
+    mbedtls_sha256_starts(&ctx, 0);
+    mbedtls_sha256_update(&ctx, k_opad, 64);
+    mbedtls_sha256_update(&ctx, tmp_hash, 32);
+    mbedtls_sha256_finish(&ctx, hmac);
+    mbedtls_sha256_free(&ctx);
+
+    return 0;
+}
+static int verify_hmac_packet(const hmac_frame_t *packet)
+{
+    uint8_t computed_hmac[32];
+    uint8_t received_hmac[8];
+
+    memcpy(received_hmac, packet->hmac, 8);
+
+    uint8_t *data_to_verify = (uint8_t*)&packet->ver;
+    size_t data_len = sizeof(hmac_frame_t) - sizeof(uint16_t) - sizeof(uint8_t[8]) - sizeof(uint16_t);
+
+    if (compute_hmac_sha256(data_to_verify, data_len, computed_hmac) != 0) {
+        return -1;
+    }
+
+    return memcmp(computed_hmac, received_hmac, 8) == 0 ? 0 : -1;
 }
 
-static HAL_StatusTypeDef uart_recv_exact(uint8_t *buf, uint16_t len,
-                                         uint32_t timeout_ms)
+static HAL_StatusTypeDef uart_recv_exact(uint8_t *buf, uint16_t len, uint32_t timeout_ms)
 {
   uint32_t start = HAL_GetTick();
   uint16_t got   = 0;
@@ -460,23 +493,6 @@ static HAL_StatusTypeDef uart_recv_exact(uint8_t *buf, uint16_t len,
   return HAL_OK;
 }
 
-//void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
-//{
-//    if (htim->Instance == TIM3)
-//    {
-//        digits_off();
-//        if (which == 0) {
-//            set_indicator(disp_left);
-//            digit_on(GPIO_PIN_10);   // первый разряд
-//            which = 1;
-//        } else {
-//            set_indicator(disp_right);
-//            digit_on(GPIO_PIN_11);   // второй разряд
-//            which = 0;
-//        }
-//        // НЕ меняем disp_left/disp_right здесь
-//    }
-//}
 /* USER CODE END 0 */
 
 /**
@@ -485,189 +501,78 @@ static HAL_StatusTypeDef uart_recv_exact(uint8_t *buf, uint16_t len,
   */
 int main(void)
 {
-  /* USER CODE BEGIN 1 */
+	/* USER CODE BEGIN 1 */
 
-  /* USER CODE END 1 */
+	/* USER CODE END 1 */
 
-  /* MCU Configuration--------------------------------------------------------*/
+	/* MCU Configuration--------------------------------------------------------*/
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
-  SystemClock_Config();
+	/* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+	HAL_Init();
+	SystemClock_Config();
 
-  rcc_config();
-  gpio_config();
-  timers_config();
+	rcc_config();
+	gpio_config();
+	timers_config();
 
-  /* USER CODE BEGIN Init */
-  // Инициализация аллокатора mbedTLS
-  mbedtls_memory_buffer_alloc_init(mbedtls_heap, sizeof(mbedtls_heap));
-  /* USER CODE END Init */
+	/* USER CODE BEGIN Init */
+	mbedtls_memory_buffer_alloc_init(mbedtls_heap, sizeof(mbedtls_heap));
+	/* USER CODE END Init */
 
-  /* Configure the system clock */
-  SystemClock_Config();
+	/* Configure the system clock */
+	SystemClock_Config();
 
-  /* USER CODE BEGIN SysInit */
+	/* USER CODE BEGIN SysInit */
 
-  /* USER CODE END SysInit */
+	/* USER CODE END SysInit */
 
-  /* Initialize all configured peripherals */
-  MX_GPIO_Init();
-  MX_TIM3_Init();
-  MX_USART2_UART_Init();
-  /* USER CODE BEGIN 2 */
-  // Запускаем таймер для мультиплексирования индикатора (TIM3 -> 1 кГц)
-  // HAL_TIM_Base_Start_IT(&htim3);
+	/* Initialize all configured peripherals */
+	MX_GPIO_Init();
+	MX_TIM3_Init();
+	MX_USART2_UART_Init();
+	/* USER CODE BEGIN 2 */
 
-  // Погасить всё и показать "00" по умолчанию
-  digits_off();
-  set_indicator(0);
-  set_display_uint(0);
-  /* USER CODE END 2 */
+	digits_off();
+	set_indicator(0);
+	set_display_uint(0);
+	/* USER CODE END 2 */
 
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
-//  while (1)
-//  {
-//    // Можно мигать светодиодом, чтобы видеть, что RX жив
-//    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_9);
-//
-//    // --- Поиск начала кадра (SOF = 0xAA55) ---
-//    // найти SOF (читаем сразу 2 байта как слово)
-//          uint16_t sof = 0;
-//          do {
-//            if (uart_recv_exact((uint8_t*)&sof, 2, 5000) != HAL_OK)
-//              continue;                  // ждём дальше
-//          } while (sof != SOF_WORD);     // SOF_WORD = 0xAA55
-//
-//    // --- Чтение payload: ver(1) + seq(4) + ts(4) + temp(2) + hum(2) ---
-//    uint8_t payload[1 + 4 + 4 + 2 + 2];
-//    if (uart_recv_exact(payload, sizeof(payload), 50) != HAL_OK)
-//      continue;
-//
-//    // --- Длина и тело подписи ---
-//    uint8_t sig_len = 0;
-//    if (uart_recv_exact(&sig_len, 1, 50) != HAL_OK)
-//      continue;
-//    if (sig_len == 0 || sig_len > 80)
-//      continue;
-//
-//    uint8_t sig[80];
-//    if (uart_recv_exact(sig, sig_len, 100) != HAL_OK)
-//      continue;
-//
-//
-//    // --- Контроль EOF ---
-//    uint8_t eof_bytes[2];
-//    if (uart_recv_exact(eof_bytes, 2, 50) != HAL_OK)
-//      continue;
-//    uint16_t eof = (uint16_t)(eof_bytes[0] | ((uint16_t)eof_bytes[1] << 8));
-//    if (eof != EOF_WORD)
-//      continue;
-//
-////    // --- Проверка подписи ---
-////    if (verify_der_p256(payload, sizeof(payload), sig, sig_len) != 0) {
-////      // Неверная подпись — мигаем другим светодиодом (PC8)
-////      HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_8);
-////      continue;
-////    }
-//
-//    // --- Парсинг полезной нагрузки ---
-//    uint8_t  ver  = payload[0];
-//    (void)ver; // пока версия не используется
-//
-//    uint32_t seq = 0;
-//    memcpy(&seq, &payload[1], 4);
-//
-//    uint32_t ts  = 0;
-//    memcpy(&ts, &payload[5], 4);
-//
-//    int16_t  t_c = 0;
-//    memcpy(&t_c, &payload[9], 2);
-//
-//    uint16_t h_p = 0;
-//    memcpy(&h_p, &payload[11], 2);
-//
-//    // Сохраняем последние значения для отображения
-//    last_t = t_c;
-//    last_h = h_p;
-//
-//    // Немедленно обновим то, что сейчас показываем (температура или влажность)
-//    uint8_t val = (show_temp
-//                   ? (uint8_t)(t_c < 0 ? 0 : (t_c > 99 ? 99 : t_c))
-//                   : (uint8_t)(h_p > 99 ? 99 : h_p));
-//    set_display_uint(val);
-//  }
-//    /* USER CODE END WHILE */
-//
-//    /* USER CODE BEGIN 3 */
-//  }
-//  /* USER CODE END 3 */
+	/* Infinite loop */
+	/* USER CODE BEGIN WHILE */
 
-  	 char line[64];
-     uint8_t idx = 0;
+	while (1)
+	  {
+	    hmac_frame_t packet;
 
-//     indicator_number = 1234;
-//     set_all_indicators(indicator_number);
+	    if (uart_recv_exact((uint8_t*)&packet, sizeof(packet), 5000) == HAL_OK)
+	    {
+	        if (packet.sof != SOF_WORD || packet.eof != EOF_WORD) {
+	            continue;
+	        }
 
-     HAL_Delay(1000);
+	        if (verify_hmac_packet(&packet) == 0)
+	        {
+	            if (packet.temp_c == -1) {
+	                HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_8);
+	                HAL_Delay(2000);
+	            } else {
+	                last_t = packet.temp_c;
+	                last_h = packet.hum_pc;
 
-     while (1)
-     {
-         uint8_t b;
-         if (HAL_UART_Receive(&huart2, &b, 1, 100) == HAL_OK)
-         {
-             if (b == '\n' || b == '\r')        // конец строки
-             {
-                 if (idx == 0) {
-                     // пустая строка — игнорируем
-                     continue;
-                 }
+	                uint8_t val = (show_temp
+	                    ? (uint8_t)(last_t < 0 ? 0 : (last_t > 99 ? 99 : last_t))
+	                    : (uint8_t)(last_h > 99 ? 99 : last_h));
+	                set_display_uint(val);
 
-                 line[idx] = '\0';
-                 idx = 0;
-
-                 int t = 0, h = 0;
-
-                 // пробуем распарсить "T=23 H=45"
-                 if (sscanf(line, "T=%d H=%d", &t, &h) == 2)
-                 {
-                     if (t < 0)    t = 0;
-                     if (t > 9999) t = 9999;
-
-                     indicator_number = t;   // TIM2_IRQHandler сам обновит индикацию
-
-                     // успешный кадр — мигнём PC9
-                     HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_9);
-                 }
-                 else if (strcmp(line, "ERR") == 0)
-                 {
-                     // с TX пришло "ERR" → датчик не ответил
-                     HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_8);
-                 }
-                 else
-                 {
-                     // какая-то непонятная строка
-                     HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_8);
-                 }
-             }
-             else
-             {
-                 // накапливаем символы до конца строки
-                 if (idx < sizeof(line) - 1)
-                 {
-                     line[idx++] = b;
-                 }
-                 else
-                 {
-                     // переполнение буфера — сброс
-                     idx = 0;
-                 }
-             }
-         }
-
-         // без HAL_Delay() тут — UART и так блокирующий
-     }
+	                indicator_number = last_t;
+	                HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_9);
+	            }
+	        } else {
+	            HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_8);
+	            HAL_Delay(2000);
+	        }
+	    }
+	 }
 }
 
 
@@ -709,38 +614,6 @@ void SystemClock_Config(void)
     Error_Handler();
   }
 }
-
-/* USER CODE BEGIN 4 */
-//void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
-//{
-//  if (htim->Instance == TIM3) {
-//    static uint32_t tick = 0;
-//
-//    // мультиплексирование двух разрядов
-//    digits_off();
-//    if (which == 0) {
-//      set_indicator(disp_left);
-//      digit_on(GPIO_PIN_10);
-//      which = 1;
-//    } else {
-//      set_indicator(disp_right);
-//      digit_on(GPIO_PIN_11);
-//      which = 0;
-//    }
-//
-//    // раз в секунду переключаемся между температурой и влажностью
-//    if (++tick >= 1000) {
-//      tick = 0;
-//      show_temp ^= 1;
-//
-//      uint8_t v = (show_temp
-//                   ? (uint8_t)(last_t < 0 ? 0 : (last_t > 99 ? 99 : last_t))
-//                   : (uint8_t)(last_h > 99 ? 99 : last_h));
-//      set_display_uint(v);
-//    }
-//  }
-//}
-/* USER CODE END 4 */
 
 /**
   * @brief  This function is executed in case of error occurrence.

@@ -16,23 +16,20 @@
   ******************************************************************************
   */
 /* USER CODE END Header */
-/* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
 
-/* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <string.h>
 #include <stdio.h>
 
-#include "mbedtls/ecdsa.h"
-#include "mbedtls/ecp.h"
+#include "mbedtls/md.h"
 #include "mbedtls/sha256.h"
 #include "mbedtls/memory_buffer_alloc.h"
 
-#include "DHT.h"   // библиотека DHT из старого проекта
+#include "DHT.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -45,8 +42,9 @@ typedef struct {
   uint32_t ts_ms;
   int16_t  temp_c;   // целое, градусы C
   uint16_t hum_pc;   // целое, %
-  uint8_t  sig_len;  // длина DER подписи
-} frame_hdr_t;
+  uint8_t  hmac[8];  // первые 8 байт HMAC-SHA256
+  uint16_t eof;      // 0x55AA
+} hmac_frame_t;
 #pragma pack(pop)
 /* USER CODE END PTD */
 
@@ -56,7 +54,7 @@ typedef struct {
 #define EOF_WORD     0x55AAu
 
 // ЗАМЕНИТЕ НА СВОЙ приватный ключ (32 байта, big-endian)
-static const uint8_t privkey_d[32] = {
+static const uint8_t hmac_key[32] = {
   0xfd, 0xc5, 0xbe, 0xb0, 0x72, 0x1c, 0x64, 0x04,
   0x4f, 0x3a, 0x05, 0xc3, 0x6f, 0xdc, 0xab, 0xb8,
   0xb5, 0x97, 0xbd, 0xd1, 0xc7, 0x54, 0xa1, 0x35,
@@ -69,45 +67,101 @@ static uint8_t mbedtls_heap[6*1024];
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
 
-/* Подпись DER (детерминированная ECDSA P-256) */
-static int sign_der_p256(const uint8_t *msg, size_t len,
-                         uint8_t *sig, size_t *sig_len)
+/**
+ * Вычисляет HMAC-SHA256 подпись для данных
+ * @param data - входные данные
+ * @param data_len - длина данных
+ * @param hmac - буфер для HMAC (32 байта)
+ * @return 0 при успехе, иначе код ошибки
+ */
+/**
+ * Упрощенная HMAC-SHA256 реализация без mbedtls_md
+ */
+static int compute_hmac_sha256(const uint8_t *data, size_t data_len, uint8_t *hmac)
 {
-  int ret;
-  uint8_t hash[32];
-  mbedtls_ecdsa_context ctx;
-  mbedtls_ecdsa_init(&ctx);
+    mbedtls_sha256_context ctx;
+    uint8_t k_ipad[64];
+    uint8_t k_opad[64];
+    uint8_t tmp_hash[32];
+    size_t i;
 
-  // Загружаем группу P-256
-  if ((ret = mbedtls_ecp_group_load(&ctx.grp, MBEDTLS_ECP_DP_SECP256R1)) != 0)
-    goto out;
+    // Инициализация pads
+    memset(k_ipad, 0, 64);
+    memset(k_opad, 0, 64);
 
-  // Загружаем приватный ключ d
-  if ((ret = mbedtls_mpi_read_binary(&ctx.d, privkey_d, sizeof(privkey_d))) != 0)
-    goto out;
+    // Копируем ключ (предполагаем, что ключ 32 байта или меньше)
+    if (sizeof(hmac_key) <= 64) {
+        memcpy(k_ipad, hmac_key, sizeof(hmac_key));
+        memcpy(k_opad, hmac_key, sizeof(hmac_key));
+    } else {
+        // Если ключ длиннее - хешируем его
+        mbedtls_sha256_init(&ctx);
+        mbedtls_sha256_starts(&ctx, 0);
+        mbedtls_sha256_update(&ctx, hmac_key, sizeof(hmac_key));
+        mbedtls_sha256_finish(&ctx, k_ipad);
+        mbedtls_sha256_free(&ctx);
+        memcpy(k_opad, k_ipad, 32);
+    }
 
-  // Хешируем сообщение
-  mbedtls_sha256_ret(msg, len, hash, 0);
+    // XOR с константами
+    for (i = 0; i < 64; i++) {
+        k_ipad[i] ^= 0x36;
+        k_opad[i] ^= 0x5C;
+    }
 
-  // Подписываем (детерминированная ECDSA по RFC 6979: RNG = NULL)
-  ret = mbedtls_ecdsa_write_signature(
-      &ctx,
-      MBEDTLS_MD_SHA256,
-      hash, sizeof(hash),
-      sig, sig_len,
-      NULL, NULL);
+    // Внутренний хеш: hash((key ^ ipad) || message)
+    mbedtls_sha256_init(&ctx);
+    mbedtls_sha256_starts(&ctx, 0);
+    mbedtls_sha256_update(&ctx, k_ipad, 64);
+    mbedtls_sha256_update(&ctx, data, data_len);
+    mbedtls_sha256_finish(&ctx, tmp_hash);
+    mbedtls_sha256_free(&ctx);
 
-out:
-  mbedtls_ecdsa_free(&ctx);
-  return ret;
+    // Внешний хеш: hash((key ^ opad) || inner_hash)
+    mbedtls_sha256_init(&ctx);
+    mbedtls_sha256_starts(&ctx, 0);
+    mbedtls_sha256_update(&ctx, k_opad, 64);
+    mbedtls_sha256_update(&ctx, tmp_hash, 32);
+    mbedtls_sha256_finish(&ctx, hmac);
+    mbedtls_sha256_free(&ctx);
+
+    return 0;
 }
+
+static int create_hmac_packet(hmac_frame_t *packet, uint32_t seq, int16_t temp, uint16_t hum)
+{
+    uint8_t full_hmac[32];
+
+    // Заполняем заголовок
+    packet->sof = SOF_WORD;
+    packet->ver = 1;
+    packet->seq = seq;
+    packet->ts_ms = HAL_GetTick();
+    packet->temp_c = temp;
+    packet->hum_pc = hum;
+    packet->eof = EOF_WORD;
+
+    // Вычисляем HMAC для всех полей кроме SOF, HMAC и EOF
+    uint8_t *data_to_sign = (uint8_t*)&packet->ver;
+    size_t data_len = sizeof(hmac_frame_t) - sizeof(uint16_t) - sizeof(uint8_t[8]) - sizeof(uint16_t);
+
+    if (compute_hmac_sha256(data_to_sign, data_len, full_hmac) != 0) {
+        return -1;
+    }
+
+    // Используем только первые 8 байт HMAC для экономии трафика
+    memcpy(packet->hmac, full_hmac, 8);
+
+    return 0;
+}
+
+
+
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN PV */
-static uint32_t   seq = 0;
-
-// тот самый датчик, как в старом проекте
+static uint32_t sequence_number = 0;
 static DHT_sensor bedRoom = { GPIOA, GPIO_PIN_7, DHT11, GPIO_PULLUP };
 /* USER CODE END PV */
 
@@ -128,122 +182,48 @@ void SystemClock_Config(void);
   */
 int main(void)
 {
-  /* USER CODE BEGIN 1 */
+	/* USER CODE BEGIN 1 */
 
-  /* USER CODE END 1 */
+	/* USER CODE END 1 */
 
-  /* MCU Configuration--------------------------------------------------------*/
+	/* MCU Configuration--------------------------------------------------------*/
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
+	/* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+	HAL_Init();
 
 
-  /* USER CODE BEGIN Init */
-  // Инициализация аллокатора mbedTLS
-  mbedtls_memory_buffer_alloc_init(mbedtls_heap, sizeof(mbedtls_heap));
-  /* USER CODE END Init */
+	/* USER CODE BEGIN Init */
+	// Инициализация аллокатора mbedTLS
+	mbedtls_memory_buffer_alloc_init(mbedtls_heap, sizeof(mbedtls_heap));
+	/* USER CODE END Init */
 
-  /* Configure the system clock */
-  SystemClock_Config();
+	/* Configure the system clock */
+	SystemClock_Config();
 
-  /* USER CODE BEGIN SysInit */
+	/* USER CODE BEGIN SysInit */
 
-  /* USER CODE END SysInit */
+	/* USER CODE END SysInit */
 
-  /* Initialize all configured peripherals */
-  MX_GPIO_Init();
-  MX_TIM3_Init();
-  MX_USART2_UART_Init();
-  /* USER CODE BEGIN 2 */
+	/* Initialize all configured peripherals */
+	MX_GPIO_Init();
+	MX_TIM3_Init();
+	MX_USART2_UART_Init();
+	/* USER CODE BEGIN 2 */
 
-  // таймер нам сейчас не обязателен для DHT, но можно оставить
-  HAL_TIM_Base_Start(&htim3);
+	// таймер нам сейчас не обязателен для DHT, но можно оставить
+	HAL_TIM_Base_Start(&htim3);
 
-  // если CubeMX не включает тактирование порта D — подстрахуемся
-  __HAL_RCC_GPIOD_CLK_ENABLE();
+	// если CubeMX не включает тактирование порта D — подстрахуемся
+	__HAL_RCC_GPIOD_CLK_ENABLE();
 
-  // светодиодом будем мигать как индикацией работы TX
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_9, GPIO_PIN_RESET);
-  /* USER CODE END 2 */
+	// светодиодом будем мигать как индикацией работы TX
+	HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_SET);
+	HAL_GPIO_WritePin(GPIOC, GPIO_PIN_9, GPIO_PIN_RESET);
+	/* USER CODE END 2 */
 
-//  /* Infinite loop */
-//  /* USER CODE BEGIN WHILE */
-//  for(;;)
-//  {
-//    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_9);
-//
-//    // --- ЧТЕНИЕ ДАТЧИКА DHT ЧЕРЕЗ БИБЛИОТЕКУ ИЗ СТАРОГО ПРОЕКТА ---
-//    DHT_data d = DHT_getData(&bedRoom);
-//
-//    // Библиотека возвращает -128.0f при ошибке чтения
-//    if (d.temp == -128.0f || d.hum == -128.0f)
-//    {
-//      // Ошибка датчика — просто ждём и пробуем ещё раз
-//      HAL_Delay(1000);
-//      continue;
-//    }
-//
-//    // Преобразуем float → целые значения, как в протоколе
-//    int16_t  t_c  = (int16_t)(d.temp  + (d.temp  >= 0.0f ? 0.5f : -0.5f));   // округление
-//    uint16_t h_pc = (uint16_t)(d.hum + 0.5f);
-//
-//    // --- ФОРМИРОВАНИЕ PAYLOAD ---
-//    // payload: ver(1) + seq(4) + ts(4) + t(2) + h(2)
-//    uint8_t payload[1 + 4 + 4 + 2 + 2];
-//    size_t  off = 0;
-//
-//    payload[off++] = 1;  // версия протокола
-//
-//    uint32_t s  = ++seq;
-//    uint32_t ts = HAL_GetTick();   // «время» в миллисекундах от старта
-//
-//    memcpy(&payload[off], &s,  4); off += 4;
-//    memcpy(&payload[off], &ts, 4); off += 4;
-//    memcpy(&payload[off], &t_c, 2); off += 2;
-//    memcpy(&payload[off], &h_pc,2); off += 2;
-//
-//    // --- ПОДПИСЬ ECDSA P-256 / SHA-256 ---
-//    uint8_t sig[80];
-//    size_t  sig_len = 0;
-//
-//    if (sign_der_p256(payload, sizeof(payload), sig, &sig_len) != 0)
-//    {
-//      // если подпись не удалась — мигаем быстрее и пропускаем кадр
-//      HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_8);
-//      HAL_Delay(500);
-//      continue;
-//    }
-//
-//    // --- ФОРМИРОВАНИЕ КАДРА ДЛЯ UART ---
-//    // [SOF(2)] [payload] [sig_len(1)] [sig(sig_len)] [EOF(2)]
-//    uint8_t  buf[2 + sizeof(payload) + 1 + 80 + 2];
-//    size_t   w   = 0;
-//    uint16_t sof = SOF_WORD;
-//    uint16_t eof = EOF_WORD;
-//
-//    memcpy(&buf[w], &sof, 2);           w += 2;
-//    memcpy(&buf[w], payload, sizeof(payload)); w += sizeof(payload);
-//    buf[w++] = (uint8_t)sig_len;
-//    memcpy(&buf[w], sig, sig_len);      w += sig_len;
-//    memcpy(&buf[w], &eof, 2);           w += 2;
-//
-//    // --- ОТПРАВКА ПО UART2 ---
-//    HAL_UART_Transmit(&huart2, buf, (uint16_t)w, 100);
-//
-//    // DHT11 по даташиту 1 Гц, но наша библиотека сама ограничивает опрос
-//    HAL_Delay(2000);
-//  }
-  /* USER CODE END WHILE */
+	// Светодиод на TX, чтобы видеть, что всё живо
+	HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_RESET);
 
-  /* USER CODE BEGIN 3 */
-//}
-///* USER CODE END 3 */
-
-    // Светодиод на TX, чтобы видеть, что всё живо
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_RESET);
-
-    char buf[64];
 
     while (1)
     {
@@ -251,8 +231,17 @@ int main(void)
 
         // Если датчик не отвечает, просто шлём "ERR"
         if (d.temp == -128.0f || d.hum == -128.0f) {
-            const char *err = "ERR\n";
-            HAL_UART_Transmit(&huart2, (uint8_t*)err, strlen(err), 100);
+            hmac_frame_t err_packet;
+            err_packet.sof = SOF_WORD;
+            err_packet.ver = 1;
+            err_packet.seq = sequence_number++;
+            err_packet.ts_ms = HAL_GetTick();
+            err_packet.temp_c = -1;  // специальное значение для ошибки
+            err_packet.hum_pc = 0;
+            err_packet.eof = EOF_WORD;
+            memset(err_packet.hmac, 0, 8); // нулевая подпись для ошибки
+
+            HAL_UART_Transmit(&huart2, (uint8_t*)&err_packet, sizeof(err_packet), 100);
             HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_8);
             HAL_Delay(1000);
             continue;
@@ -261,26 +250,17 @@ int main(void)
         int t = (int)(d.temp + (d.temp >= 0 ? 0.5f : -0.5f));
         int h = (int)(d.hum  + 0.5f);
 
-        // сформируем строку: "T=23 H=45\n"
-        int n = snprintf(buf, sizeof(buf), "T=%d H=%d\n", t, h);
-        if (n > 0) {
-            HAL_UART_Transmit(&huart2, (uint8_t*)buf, (uint16_t)n, 100);
+        hmac_frame_t packet;
+        if (create_hmac_packet(&packet, sequence_number++, t, h) == 0) {
+            HAL_UART_Transmit(&huart2, (uint8_t*)&packet, sizeof(packet), 100);
+            HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_9); // Успешная отправка
+        } else {
+            HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_8); // Ошибка подписи
         }
 
-        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_9);
-        HAL_Delay(1000);
+        HAL_Delay(2000);
     }
 }
-//    while (1)
-//    {
-//        const char *test = "T=25 H=60\n";
-//        HAL_UART_Transmit(&huart2, (uint8_t*)test, strlen(test), 100);
-//
-//        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_8);  // TX жив
-//        HAL_Delay(1000);
-//    }
-//}
-
 
 /**
   * @brief System Clock Configuration
