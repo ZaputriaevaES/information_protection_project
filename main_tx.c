@@ -155,8 +155,6 @@ static int create_hmac_packet(hmac_frame_t *packet, uint32_t seq, int16_t temp, 
     return 0;
 }
 
-
-
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -173,6 +171,203 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+#define ESP_UART huart2   // UART, который подключен к ESP-01
+
+// Сбросить приёмник UART (выкинуть хвосты из буфера)
+static void esp_clear_rx(void)
+{
+    uint8_t c;
+    while (HAL_UART_Receive(&ESP_UART, &c, 1, 10) == HAL_OK) {
+        // просто читаем до таймаута
+    }
+}
+
+// Отправить строку (обязательно с "\r\n" в конце!)
+static HAL_StatusTypeDef esp_send_line(const char *s)
+{
+    return HAL_UART_Transmit(&ESP_UART, (uint8_t*)s, strlen(s), 1000);
+}
+
+// Аналог их echoFind(): ждём, пока в ответе появится keyword
+static int esp_wait_keyword(const char *keyword, uint32_t timeout_ms)
+{
+    uint8_t c;
+    char buf[256];
+    size_t pos = 0;
+    size_t key_len = strlen(keyword);
+    uint32_t start = HAL_GetTick();
+
+    memset(buf, 0, sizeof(buf));
+
+    while ((HAL_GetTick() - start) < timeout_ms && pos < sizeof(buf) - 1)
+    {
+        if (HAL_UART_Receive(&ESP_UART, &c, 1, 50) == HAL_OK)
+        {
+            buf[pos++] = (char)c;
+            buf[pos]   = '\0';
+
+            // Для надёжности проверяем посимвольно на наличие keyword
+            if (pos >= key_len) {
+                if (strstr(buf, keyword) != NULL) {
+                    return 0;   // нашли keyword
+                }
+            }
+        }
+    }
+    return -1; // не нашли за timeout
+}
+
+// Аналог их SendCommand(cmd, ack): отправить команду и дождаться ack
+static int esp_send_cmd(const char *cmd, const char *ack, uint32_t timeout_ms)
+{
+    esp_clear_rx();
+
+    if (esp_send_line(cmd) != HAL_OK)
+        return -10; // ошибка отправки по UART
+
+    if (ack == NULL || ack[0] == '\0')
+        return 0;   // ничего ждать не нужно
+
+    if (esp_wait_keyword(ack, timeout_ms) == 0)
+        return 0;   // всё ок
+
+    return -11;     // не дождались ack
+}
+
+// Инициализация ESP-01 на TX-плате.
+// 0  -> успех, TCP-соединение с RX установлено
+// !=0 -> код ошибки (по нему легко понять, на чем упали)
+int wifi_init_tx(void)
+{
+    int r;
+
+    // Даём модулю стабилизироваться после подачи питания
+    HAL_Delay(2000);
+    esp_clear_rx();
+
+    // >>> ШАГ 1. Проверяем связь: "AT" как в их примере
+    r = esp_send_cmd("AT\r\n", "OK", 3000);
+    if (r != 0) {
+        // Если уже здесь ошибка — ESP вообще не отвечает
+        return 100 + r;
+    }
+
+    // >>> ШАГ 2. Мягкий сброс: AT+RST, как в их коде SendCommand("AT+RST", "Ready");
+    r = esp_send_cmd("AT+RST\r\n", "OK", 5000);  // некоторые прошивки пишут "ready" в нижнем регистре
+    if (r != 0) {
+        // Если не уверены насчёт регистра, можно вместо "ready" поставить NULL и просто подождать HAL_Delay
+        // Но пока пробуем так.
+
+        return 200 + r;
+    }
+
+
+    // Небольшая пауза и очистка
+    HAL_Delay(500);
+    esp_clear_rx();
+
+    // >>> ШАГ 3. Режим STA (клиент): AT+CWMODE=1
+    r = esp_send_cmd("AT+CWMODE=1\r\n", "OK", 5000);
+    if (r != 0) {
+        return 300 + r;
+    }
+
+
+    // >>> ШАГ 4. Подключаемся к точке доступа RX-платы
+    // Здесь SSID и пароль должны совпадать с тем, что ты используешь на RX-ESP (там где CWSAP).
+    // Для примера: "STM_RX" и "12345678", как мы обсуждали раньше.
+    r = esp_send_cmd("AT+CWJAP=\"STM_RX\",\"12345678\"\r\n", "OK", 20000);
+    if (r != 0) {
+        while(1) {
+        	HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_8);
+        	HAL_Delay(1000);
+        }
+        return 400 + r;
+    }
+
+    // >>> (опционально) ШАГ 5. Проверяем IP: AT+CIFSR — как в Instructables
+    esp_send_cmd("AT+CIFSR\r\n", "OK", 5000);  // можно не проверять r строго
+
+    // >>> ШАГ 6. Один TCP-сокет: AT+CIPMUX=0
+    r = esp_send_cmd("AT+CIPMUX=0\r\n", "OK", 5000);
+    if (r != 0) {
+        return 500 + r;
+    }
+
+    // >>> ШАГ 7. Открываем TCP-соединение к RX-ESP
+    // IP 192.168.4.1 — типичный адрес точки доступа ESP в AP-режиме.
+    esp_clear_rx();
+    if (esp_send_line("AT+CIPSTART=\"TCP\",\"192.168.4.1\",5000\r\n") != HAL_OK) {
+        return 600; // не смогли отправить команду
+    }
+
+    // Ждём "CONNECT"
+    if (esp_wait_keyword("CONNECT", 10000) != 0) {
+
+        return 610; // не получили CONNECT
+    }
+
+    // И ещё дождёмся OK (как делают в некоторых примерах)
+    esp_wait_keyword("OK", 2000);
+//	HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_8);
+//    HAL_Delay(500);
+//	HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_8);
+//    HAL_Delay(500);
+
+    return 0;  // Всё ОК, ESP-01 на TX-плате подключен к RX по TCP
+}
+
+// Отправка бинарного пакета через уже установленное TCP-соединение
+// data/len — твой hmac_frame_t или любой буфер
+// 0  -> успех
+// !=0 -> код ошибки
+int wifi_send_binary(const uint8_t *data, uint16_t len)
+{
+    char cmd[32];
+    uint8_t c;
+    uint32_t start;
+
+    // Формируем команду AT+CIPSEND=<len>\r\n
+    snprintf(cmd, sizeof(cmd), "AT+CIPSEND=%u\r\n", (unsigned)len);
+
+    // Чистим приёмник перед новой командой
+    esp_clear_rx();
+
+    // Шаг 1. Отправляем AT+CIPSEND...
+    if (esp_send_line(cmd) != HAL_OK) {
+        return -10;   // ошибка передачи по UART
+    }
+
+    // Шаг 2. Ждём приглашения '>' от ESP
+    start = HAL_GetTick();
+    int got_prompt = 0;
+    while (HAL_GetTick() - start < 2000)
+    {
+        if (HAL_UART_Receive(&ESP_UART, &c, 1, 50) == HAL_OK)
+        {
+            if (c == '>') {
+                got_prompt = 1;
+                break;
+            }
+        }
+    }
+    if (!got_prompt) {
+        return -11;   // не дождались символа '>'
+    }
+
+    // Шаг 3. Отправляем сами данные (может быть чистый бинарник)
+    if (HAL_UART_Transmit(&ESP_UART, (uint8_t*)data, len, 2000) != HAL_OK) {
+        return -12;   // ошибка отправки полезной нагрузки
+    }
+
+    // Шаг 4. Ждём "SEND OK" от ESP
+    if (esp_wait_keyword("SEND OK", 5000) != 0) {
+        return -13;   // не получили подтверждение отправки
+    }
+
+    return 0; // успех
+}
 
 /* USER CODE END 0 */
 
@@ -208,6 +403,13 @@ int main(void)
 	MX_GPIO_Init();
 	MX_TIM3_Init();
 	MX_USART2_UART_Init();
+
+	if (wifi_init_tx() != 0) {
+        while(1) {
+        	HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_9);
+        	HAL_Delay(1000);
+        }
+	}
 	/* USER CODE BEGIN 2 */
 
 	// таймер нам сейчас не обязателен для DHT, но можно оставить
@@ -223,7 +425,6 @@ int main(void)
 
 	// Светодиод на TX, чтобы видеть, что всё живо
 	HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_RESET);
-
 
     while (1)
     {
@@ -252,10 +453,16 @@ int main(void)
 
         hmac_frame_t packet;
         if (create_hmac_packet(&packet, sequence_number++, t, h) == 0) {
-            HAL_UART_Transmit(&huart2, (uint8_t*)&packet, sizeof(packet), 100);
+            if (wifi_send_binary((uint8_t*)&packet, sizeof(packet)) == 0) {
+                HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_9); // Успешная отправка
+            } else {
+                HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_8); // Ошибка Wi-Fi
+                HAL_Delay(1000);
+            }
             HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_9); // Успешная отправка
         } else {
             HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_8); // Ошибка подписи
+            HAL_Delay(1000);
         }
 
         HAL_Delay(2000);

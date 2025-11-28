@@ -492,6 +492,190 @@ static HAL_StatusTypeDef uart_recv_exact(uint8_t *buf, uint16_t len, uint32_t ti
   }
   return HAL_OK;
 }
+#include <string.h>   // обязательно, для strlen, strstr, memset
+
+// UART, к которому подключён ESP-01 на RX-плате
+#define ESP_UART huart1
+
+// Сбросить приёмный буфер UART (выбросить мусор)
+static void esp_clear_rx(void)
+{
+    uint8_t c;
+    while (HAL_UART_Receive(&ESP_UART, &c, 1, 10) == HAL_OK) {
+        // просто читаем до таймаута
+    }
+}
+
+// Отправить строку (обязательно с "\r\n" в конце!)
+static HAL_StatusTypeDef esp_send_line(const char *s)
+{
+    return HAL_UART_Transmit(&ESP_UART, (uint8_t*)s, strlen(s), 1000);
+}
+
+// Ждём, пока в ответе появится подстрока keyword (как их echoFind)
+static int esp_wait_keyword(const char *keyword, uint32_t timeout_ms)
+{
+    uint8_t c;
+    char buf[256];
+    size_t pos = 0;
+    size_t key_len = strlen(keyword);
+    uint32_t start = HAL_GetTick();
+
+    memset(buf, 0, sizeof(buf));
+
+    while ((HAL_GetTick() - start) < timeout_ms && pos < sizeof(buf) - 1)
+    {
+        if (HAL_UART_Receive(&ESP_UART, &c, 1, 50) == HAL_OK)
+        {
+            buf[pos++] = (char)c;
+            buf[pos]   = '\0';
+
+            if (pos >= key_len) {
+                if (strstr(buf, keyword) != NULL) {
+                    return 0;   // нашли keyword
+                }
+            }
+        }
+    }
+    return -1; // не нашли за timeout
+}
+
+// Аналог SendCommand(cmd, ack): отправить команду и дождаться ack
+// Если ack == NULL или "", просто отправляем и не ждём.
+static int esp_send_cmd(const char *cmd, const char *ack, uint32_t timeout_ms)
+{
+    esp_clear_rx();
+
+    if (esp_send_line(cmd) != HAL_OK)
+        return -10; // ошибка отправки по UART
+
+    if (ack == NULL || ack[0] == '\0')
+        return 0;   // ничего ждать не нужно
+
+    if (esp_wait_keyword(ack, timeout_ms) == 0)
+        return 0;   // всё ок
+
+    return -11;     // не дождались ack
+}
+
+// Инициализация ESP-01 на RX-плате.
+// Делает из него точку доступа STM_RX + TCP-сервер на порту 5000.
+//
+// Возвращает 0  — всё ОК
+// Неноль        — ошибка (по коду можно понять, на каком шаге упало)
+int wifi_init_rx(void)
+{
+    int r;
+
+    // Даём ESP стабилизироваться после подачи питания
+    HAL_Delay(2000);
+    esp_clear_rx();
+
+    // ШАГ 1. Проверяем связь: "AT"
+    r = esp_send_cmd("AT\r\n", "OK", 3000);
+    if (r != 0) {
+        while(1) {
+        	HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_8);
+			HAL_Delay(1000);
+        }
+        // ESP вообще не отвечает как модем
+        return 100 + r;
+    }
+
+    // ШАГ 2. Мягкий сброс: AT+RST (как на TX — без строгой проверки текста)
+    esp_clear_rx();
+    esp_send_line("AT+RST\r\n");
+    HAL_Delay(2000);      // ждём, пока перезагрузится
+    esp_clear_rx();       // выбрасываем "ready" и логи
+
+    // ШАГ 3. Снова "AT" после сброса
+    r = esp_send_cmd("AT\r\n", "OK", 3000);
+    if (r != 0) {
+        return 200 + r;
+    }
+
+    // ШАГ 4. Включаем режим точки доступа (AP).
+    // Делаем "best effort": пробуем CUR, потом обычный CWMODE, но НЕ вылетаем при ошибке.
+    r = esp_send_cmd("AT+CWMODE_CUR=2\r\n", "OK", 5000);   // 2 = AP
+    if (r != 0) {
+        r = esp_send_cmd("AT+CWMODE=2\r\n", "OK", 5000);
+        // Если и это не OK — не считаем фатальной ошибкой, многие прошивки уже в AP+STA
+    }
+
+    // ШАГ 5. Настраиваем свою Wi-Fi сеть:
+    // SSID = "STM_RX", пароль = "12345678", канал 5, шифрование WPA2 (3)
+    r = esp_send_cmd("AT+CWSAP_CUR=\"STM_RX\",\"12345678\",5,3\r\n", "OK", 10000);
+    if (r != 0) {
+        // Если _CUR не поддерживается, пробуем без CUR
+        r = esp_send_cmd("AT+CWSAP=\"STM_RX\",\"12345678\",5,3\r\n", "OK", 10000);
+        if (r != 0) {
+            // без точки доступа далее смысла нет
+            return 300 + r;
+        }
+    }
+
+    // (опционально) можно посмотреть свой IP
+    esp_send_cmd("AT+CIFSR\r\n", "OK", 5000);
+
+    // ШАГ 6. Разрешаем несколько соединений (для сервера нужно CIPMUX=1)
+    r = esp_send_cmd("AT+CIPMUX=1\r\n", "OK", 5000);
+    if (r != 0) {
+        return 400 + r;
+    }
+
+    // ШАГ 7. Поднимаем TCP-сервер на порту 5000
+    r = esp_send_cmd("AT+CIPSERVER=1,5000\r\n", "OK", 5000);
+    if (r != 0) {
+        return 500 + r;
+    }
+
+    // (необязательно) можно задать таймаут соединений:
+    // esp_send_cmd("AT+CIPSTO=300\r\n", "OK", 5000);
+
+    return 0;   // ESP на RX-плате поднят как AP+TCP-сервер
+}
+
+static int recv_frame(hmac_frame_t *out, uint32_t timeout_ms)
+{
+    uint8_t *p = (uint8_t*)out;
+    uint32_t start = HAL_GetTick();
+
+    // 1. ждём байт 0x55, потом 0xAA
+    enum { WAIT_55, WAIT_AA, READ_REST } state = WAIT_55;
+    uint16_t idx = 0;
+
+    while (HAL_GetTick() - start < timeout_ms) {
+        uint8_t c;
+        if (HAL_UART_Receive(&huart2, &c, 1, 50) != HAL_OK)
+            continue;
+
+        switch (state) {
+        case WAIT_55:
+            if (c == 0x55) {
+                p[0] = c;
+                state = WAIT_AA;
+            }
+            break;
+        case WAIT_AA:
+            if (c == 0xAA) {
+                p[1] = c;
+                idx = 2;
+                state = READ_REST;
+            } else {
+                state = WAIT_55; // опять искать начало
+            }
+            break;
+        case READ_REST:
+            p[idx++] = c;
+            if (idx >= sizeof(hmac_frame_t)) {
+                // получили весь кадр
+                return 0;
+            }
+            break;
+        }
+    }
+    return -1; // таймаут
+}
 
 /* USER CODE END 0 */
 
@@ -530,11 +714,19 @@ int main(void)
 	MX_GPIO_Init();
 	MX_TIM3_Init();
 	MX_USART2_UART_Init();
+
+	if (wifi_init_rx() != 0) {
+        while(1) {
+        	HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_9);
+			HAL_Delay(1000);
+        }
+	}
 	/* USER CODE BEGIN 2 */
 
 	digits_off();
 	set_indicator(0);
 	set_display_uint(0);
+
 	/* USER CODE END 2 */
 
 	/* Infinite loop */
@@ -544,8 +736,7 @@ int main(void)
 	  {
 	    hmac_frame_t packet;
 
-	    if (uart_recv_exact((uint8_t*)&packet, sizeof(packet), 5000) == HAL_OK)
-	    {
+	    if (recv_frame(&packet, 5000) == 0) {
 	        if (packet.sof != SOF_WORD || packet.eof != EOF_WORD) {
 	            continue;
 	        }
