@@ -84,6 +84,14 @@ static const uint8_t hmac_key[32] = {
   0xb5, 0x97, 0xbd, 0xd1, 0xc7, 0x54, 0xa1, 0x35,
   0xf7, 0x05, 0x65, 0xde, 0xce, 0xb2, 0x86, 0x34
 };
+
+/* Лёгкий симметричный ключ для PRESENT-80 (10 байт = 80 бит) */
+static const uint8_t present80_key[10] = {
+    0x01, 0x23, 0x45, 0x67, 0x89,
+    0xAB, 0xCD, 0xEF, 0x11, 0x22
+};
+/* Можно поменять на свои случайные байты, но одинаковые на TX и RX */
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -127,7 +135,155 @@ static uint16_t last_h = 0;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
+/* === PRESENT-80: лёгкий блочный шифр для шифрования измерений === */
 
+/* 4-битный S-box PRESENT (взято из описания алгоритма) */
+static const uint8_t present_sbox[16] = {
+    0xC, 0x5, 0x6, 0xB,
+    0x9, 0x0, 0xA, 0xD,
+    0x3, 0xE, 0xF, 0x8,
+    0x4, 0x7, 0x1, 0x2
+};
+
+/* P-слой PRESENT: позиция битов после перестановки */
+static const uint8_t present_pbox[64] = {
+    /* i:  0..15  */
+    0, 16, 32, 48,  1, 17, 33, 49,
+    2, 18, 34, 50,  3, 19, 35, 51,
+    /* i: 16..31  */
+    4, 20, 36, 52,  5, 21, 37, 53,
+    6, 22, 38, 54,  7, 23, 39, 55,
+    /* i: 32..47  */
+    8, 24, 40, 56,  9, 25, 41, 57,
+    10, 26, 42, 58, 11, 27, 43, 59,
+    /* i: 48..63  */
+    12, 28, 44, 60, 13, 29, 45, 61,
+    14, 30, 46, 62, 15, 31, 47, 63
+};
+
+/* Вспомогательная: запись 32-битного числа в big-endian */
+static void put_be32(uint32_t v, uint8_t *out)
+{
+    out[0] = (uint8_t)(v >> 24);
+    out[1] = (uint8_t)(v >> 16);
+    out[2] = (uint8_t)(v >> 8);
+    out[3] = (uint8_t)(v);
+}
+
+/* Обновление 80-битного ключа: циклический сдвиг, S-box, XOR номера раунда */
+static void present80_update_key(uint8_t key[10], uint8_t round)
+{
+    uint8_t old[10];
+    uint8_t newk[10] = {0};
+
+    memcpy(old, key, 10);
+
+    /* 1) циклический сдвиг на 61 бит влево по всей 80-битной регистровой цепочке */
+    for (int i = 0; i < 80; ++i) {
+        int src = (i + 61) % 80;    // откуда брать бит
+        int src_byte = src / 8;
+        int src_bit  = src % 8;
+        uint8_t bit = (old[src_byte] >> src_bit) & 0x01;
+
+        int dst_byte = i / 8;
+        int dst_bit  = i % 8;
+        if (bit) {
+            newk[dst_byte] |= (uint8_t)(1u << dst_bit);
+        }
+    }
+
+    memcpy(key, newk, 10);
+
+    /* 2) прогоняем старший полубайт через тот же S-box */
+    uint8_t high = (uint8_t)(key[9] >> 4);          // старшие 4 бита последнего байта
+    high = present_sbox[high];
+    key[9] = (uint8_t)((high << 4) | (key[9] & 0x0F));
+
+    /* 3) XOR номера раунда в несколько бит ключа (для простоты — младшие 5 бит key[1]) */
+    key[1] ^= (uint8_t)(round & 0x1F);
+}
+
+/* Один раунд pLayer: перестановка битов в состоянии */
+static void present_pLayer(uint8_t state[8])
+{
+    uint8_t tmp[8] = {0};
+
+    for (int i = 0; i < 64; ++i) {
+        uint8_t bit = (state[i / 8] >> (i % 8)) & 0x01;
+        if (bit) {
+            uint8_t pos = present_pbox[i];
+            tmp[pos / 8] |= (uint8_t)(1u << (pos % 8));
+        }
+    }
+
+    memcpy(state, tmp, 8);
+}
+
+/* Шифрование одного 64-битного блока с помощью PRESENT-80 */
+static void present80_encrypt_block(const uint8_t master_key[10],
+                                    const uint8_t in[8],
+                                    uint8_t out[8])
+{
+    uint8_t state[8];
+    uint8_t key[10];
+
+    memcpy(state, in, 8);
+    memcpy(key, master_key, 10);
+
+    /* 31 раунд */
+    for (uint8_t round = 1; round <= 31; ++round) {
+        /* 1. AddRoundKey: XOR состояния с первыми 8 байтами ключа */
+        for (int i = 0; i < 8; ++i) {
+            state[i] ^= key[i];
+        }
+
+        /* 2. SubCells: применяем S-box к каждому 4-битному полубайту */
+        for (int i = 0; i < 8; ++i) {
+            uint8_t hi = (uint8_t)(state[i] >> 4);
+            uint8_t lo = (uint8_t)(state[i] & 0x0F);
+            hi = present_sbox[hi];
+            lo = present_sbox[lo];
+            state[i] = (uint8_t)((hi << 4) | lo);
+        }
+
+        /* 3. PermuteBits: P-слой */
+        present_pLayer(state);
+
+        /* 4. Обновляем ключ к следующему раунду */
+        present80_update_key(key, round);
+    }
+
+    /* Финальный XOR с ключом (post-whitening) */
+    for (int i = 0; i < 8; ++i) {
+        state[i] ^= key[i];
+    }
+
+    memcpy(out, state, 8);
+}
+
+/* === Шифрование/расшифрование измерений в кадре (CTR на PRESENT) === */
+
+static void present_crypt_measurements(hmac_frame_t *packet)
+{
+    uint8_t ctr[8];
+    uint8_t keystream[8];
+
+    /* Счётчик = seq || ts_ms (по 32 бита, big-endian) */
+    put_be32(packet->seq,   &ctr[0]);
+    put_be32(packet->ts_ms, &ctr[4]);
+
+    /* keystream = PRESENT_K(ctr) */
+    present80_encrypt_block(present80_key, ctr, keystream);
+
+
+
+    /* Шифруем/расшифровываем 4 байта: temp_c (2 байта) + hum_pc (2 байта) */
+    uint8_t *m = (uint8_t*)&packet->temp_c;
+    for (int i = 0; i < 4; ++i) {
+        m[i] ^= keystream[i];
+    }
+    /* Повторный вызов этой функции на RX выполняет обратную операцию (XOR) */
+}
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -495,7 +651,7 @@ static HAL_StatusTypeDef uart_recv_exact(uint8_t *buf, uint16_t len, uint32_t ti
 #include <string.h>   // обязательно, для strlen, strstr, memset
 
 // UART, к которому подключён ESP-01 на RX-плате
-#define ESP_UART huart1
+#define ESP_UART huart2
 
 // Сбросить приёмный буфер UART (выбросить мусор)
 static void esp_clear_rx(void)
@@ -743,9 +899,10 @@ int main(void)
 
 	        if (verify_hmac_packet(&packet) == 0)
 	        {
+	            present_crypt_measurements(&packet);
 	            if (packet.temp_c == -1) {
 	                HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_8);
-	                HAL_Delay(2000);
+	                HAL_Delay(1000);
 	            } else {
 	                last_t = packet.temp_c;
 	                last_h = packet.hum_pc;
@@ -757,10 +914,11 @@ int main(void)
 
 	                indicator_number = last_t;
 	                HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_9);
+		            HAL_Delay(1000);
 	            }
 	        } else {
 	            HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_8);
-	            HAL_Delay(2000);
+	            HAL_Delay(1000);
 	        }
 	    }
 	 }
