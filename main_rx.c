@@ -116,12 +116,6 @@ static inline void digit_on(uint16_t pin)
 /**
   * Значение для отображения (0..99) разбивается на левый и правый разряд.
   */
-static volatile uint8_t disp_left = 0, disp_right = 0, which = 0;
-static inline void set_display_uint(uint8_t v)
-{
-    disp_left  = v / 10;
-    disp_right = v % 10;
-}
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -350,6 +344,7 @@ static void gpio_config(void)
      */
     LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOA);
     LL_GPIO_SetPinPull(GPIOA, LL_GPIO_PIN_0, LL_GPIO_PULL_DOWN);
+
     /*
      * Init port for DHT11
      */
@@ -446,17 +441,24 @@ static void exti_config(void)
     NVIC_SetPriority(EXTI0_1_IRQn, 0);
 }
 
-//static char show_temp = 0;
 
 void EXTI0_1_IRQHandler(void)
 {
 	if((ms - ms_old) > 50)
      {
     	 show_temp = (show_temp + 1)%2;
+         int val = (show_temp
+             ? (int)(last_t < 0 ? 0 : (last_t > 99 ? 99 : last_t))
+             : (int)(last_h > 99 ? 99 : last_h));
+
+         indicator_number = val;
+    	 set_all_indicators(indicator_number);
+
      }
 
     ms_old = ms;
-
+//    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_8);
+//    HAL_Delay(1000);
     LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_0);
 }
 
@@ -484,26 +486,65 @@ static void set_indicator(uint8_t number)
                            LL_GPIO_PIN_3 | LL_GPIO_PIN_4 | LL_GPIO_PIN_5 | \
                            LL_GPIO_PIN_6 ;
     /*
-     * For simplicity there are only decoded values for the first 4 numbers
+     * Таблица символов для 7-сегментного индикатора:
+     * 0-9: цифры
+     * 10-16: специальные символы (t, P, h, u, -, пусто)
      */
     static const uint32_t decoder[] = {
+        /* Цифры 0-9 (проверяем правильность) */
+        /* 0: abcdef */
         LL_GPIO_PIN_0 | LL_GPIO_PIN_1 | LL_GPIO_PIN_2 | LL_GPIO_PIN_3 | \
-        LL_GPIO_PIN_4 | LL_GPIO_PIN_5, 						// 0
-        LL_GPIO_PIN_1 | LL_GPIO_PIN_2, 						// 1
-        LL_GPIO_PIN_0 | LL_GPIO_PIN_1 | LL_GPIO_PIN_6 | LL_GPIO_PIN_4 | \
-        LL_GPIO_PIN_3, 								// 2
-        LL_GPIO_PIN_0 | LL_GPIO_PIN_1 | LL_GPIO_PIN_6 | LL_GPIO_PIN_2 | \
-        LL_GPIO_PIN_3, 								// 3
-        LL_GPIO_PIN_5 | LL_GPIO_PIN_6 | LL_GPIO_PIN_1 | LL_GPIO_PIN_2, 		// 4
+        LL_GPIO_PIN_4 | LL_GPIO_PIN_5,                                     // 0
+
+        /* 1: bc */
+        LL_GPIO_PIN_1 | LL_GPIO_PIN_2,                                     // 1
+
+        /* 2: abdeg */
+        LL_GPIO_PIN_0 | LL_GPIO_PIN_1 | LL_GPIO_PIN_3 | LL_GPIO_PIN_4 | \
+        LL_GPIO_PIN_6,                                                     // 2
+
+        /* 3: abcdg */
+        LL_GPIO_PIN_0 | LL_GPIO_PIN_1 | LL_GPIO_PIN_2 | LL_GPIO_PIN_3 | \
+        LL_GPIO_PIN_6,                                                     // 3
+
+        /* 4: bcfg */
+        LL_GPIO_PIN_1 | LL_GPIO_PIN_2 | LL_GPIO_PIN_5 | LL_GPIO_PIN_6,     // 4
+
+        /* 5: acdfg */
         LL_GPIO_PIN_0 | LL_GPIO_PIN_2 | LL_GPIO_PIN_3 | LL_GPIO_PIN_5 | \
-        LL_GPIO_PIN_6, 								// 5
+        LL_GPIO_PIN_6,                                                     // 5
+
+        /* 6: acdefg */
         LL_GPIO_PIN_0 | LL_GPIO_PIN_2 | LL_GPIO_PIN_3 | LL_GPIO_PIN_4 | \
-        LL_GPIO_PIN_5 | LL_GPIO_PIN_6, 						// 6
-        LL_GPIO_PIN_0 | LL_GPIO_PIN_1 | LL_GPIO_PIN_2, 				// 7
+        LL_GPIO_PIN_5 | LL_GPIO_PIN_6,                                     // 6
+
+        /* 7: abc */
+        LL_GPIO_PIN_0 | LL_GPIO_PIN_1 | LL_GPIO_PIN_2,                     // 7
+
+        /* 8: abcdefg */
         LL_GPIO_PIN_0 | LL_GPIO_PIN_1 | LL_GPIO_PIN_2 | LL_GPIO_PIN_3 | \
-        LL_GPIO_PIN_4 | LL_GPIO_PIN_5 | LL_GPIO_PIN_6, 				// 8
+        LL_GPIO_PIN_4 | LL_GPIO_PIN_5 | LL_GPIO_PIN_6,                     // 8
+
+        /* 9: abcdfg */
         LL_GPIO_PIN_0 | LL_GPIO_PIN_1 | LL_GPIO_PIN_2 | LL_GPIO_PIN_3 | \
-        LL_GPIO_PIN_5 | LL_GPIO_PIN_6, 						// 9
+        LL_GPIO_PIN_5 | LL_GPIO_PIN_6,                                     // 9
+
+        /* Специальные символы */
+        /* 10: 't' - adefg (верхняя горизонталь + средняя + нижняя левая) */
+        LL_GPIO_PIN_3 | LL_GPIO_PIN_4 | LL_GPIO_PIN_5 | \
+        LL_GPIO_PIN_6,                                                     // 10: 't'
+
+        /* 11: 'P' - abefg (почти как 8 без c и d) */
+        LL_GPIO_PIN_0 | LL_GPIO_PIN_1 | LL_GPIO_PIN_4 | LL_GPIO_PIN_5 | \
+        LL_GPIO_PIN_6,                                                     // 11: 'P'
+
+        /* 12: 'h' - cefg (как 4, но без b) */
+        LL_GPIO_PIN_1 | LL_GPIO_PIN_2 | LL_GPIO_PIN_4 | LL_GPIO_PIN_5 | \
+        LL_GPIO_PIN_6,                                                     // 12: 'h'
+
+        /* 13: 'u' - cde (нижняя часть буквы u) */
+        LL_GPIO_PIN_1 | LL_GPIO_PIN_2 | LL_GPIO_PIN_3 | LL_GPIO_PIN_4 | \
+        LL_GPIO_PIN_5                                                      // 13: 'u'
     };
     const uint8_t max_num = sizeof(decoder) / sizeof(uint32_t);
     uint32_t port_state = 0;
@@ -513,14 +554,9 @@ static void set_indicator(uint8_t number)
      * indicator (that is done by using masking)
      */
     port_state = LL_GPIO_ReadOutputPort(GPIOB);
+
     /*
-     * Example:
-     * 01100101 <= Input
-     * mask = 111 (pins allowed to be changed)
-     * ~mask = 11111000 (inverted mask sets remaing bits to one)
-     * result = result & ~mask (zero only first three bits)
-     * result = result | 001 (modify first three bits)
-     * result -> 01100001
+     * Преобразуем входной символ (0-15) в битовую маску сегментов
      */
     port_state = (port_state & ~mask) | decoder[number % max_num];
     LL_GPIO_WriteOutputPort(GPIOB, port_state);
@@ -853,6 +889,8 @@ int main(void)
 
 	rcc_config();
 	gpio_config();
+    systick_config();
+    exti_config();
 	timers_config();
 
 	/* USER CODE BEGIN Init */
@@ -881,7 +919,6 @@ int main(void)
 
 	digits_off();
 	set_indicator(0);
-	set_display_uint(0);
 
 	/* USER CODE END 2 */
 
@@ -907,12 +944,11 @@ int main(void)
 	                last_t = packet.temp_c;
 	                last_h = packet.hum_pc;
 
-	                uint8_t val = (show_temp
-	                    ? (uint8_t)(last_t < 0 ? 0 : (last_t > 99 ? 99 : last_t))
-	                    : (uint8_t)(last_h > 99 ? 99 : last_h));
-	                set_display_uint(val);
+	                int val = (show_temp
+	                    ? (int)(last_t < 0 ? 0 : (last_t > 99 ? 99 : last_t))
+	                    : (int)(last_h > 99 ? 99 : last_h));
 
-	                indicator_number = last_t;
+	                indicator_number = val;
 	                HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_9);
 		            HAL_Delay(1000);
 	            }
